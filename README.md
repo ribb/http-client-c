@@ -1,6 +1,6 @@
 ![My image](http://i.imgur.com/bYam0RK.png)
 
-http-client-c
+http-client-c support SSL
 =============
 
 A quick and dirty HTTP client library in and for C. The intention of http-client-c is to write an easy-to-use HTTP client in and for C.
