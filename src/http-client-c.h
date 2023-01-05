@@ -30,30 +30,45 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#ifdef _WIN32
-	#include <winsock2.h>
-	#include <ws2tcpip.h>
-	#include <stdio.h>
-	#pragma comment(lib, "Ws2_32.lib")
-#elif _LINUX
-	#include <sys/socket.h>
-#elif __FreeBSD__
+
+//#ifdef _WIN32
+//	#include <winsock2.h>
+//	#include <ws2tcpip.h>
+//	#include <stdio.h>
+//	#pragma comment(lib, "Ws2_32.lib")
+//#elif _LINUX
+//	#include <sys/socket.h>
+//#elif __FreeBSD__
     #include <sys/socket.h>
+	
     #include <netinet/in.h>
     #include <netdb.h>
     #include <arpa/inet.h>
-#else
-	#error Platform not suppoted.
+    #include <unistd.h>
+	
+//#define OPENSSL
+#if defined(OPENSSL)
+	#include <openssl/crypto.h>
+	#include <openssl/bio.h>
+	#include <openssl/ssl.h>
+	#include <openssl/err.h>
+	#include <openssl/pem.h>
+	#include <openssl/x509.h>
+	#include <openssl/x509_vfy.h>
 #endif
+//#else
+//	#error Platform not suppoted.
+//#endif
 
 #include <errno.h>
-#include "stringx.h";
+#include "stringx.h"
 #include "urlparser.h"
 
 /*
 	Prototype functions
 */
 struct http_response* http_req(char *http_headers, struct parsed_url *purl);
+struct http_response* http_put(char *url, char *custom_headers);
 struct http_response* http_get(char *url, char *custom_headers);
 struct http_response* http_head(char *url, char *custom_headers);
 struct http_response* http_post(char *url, char *custom_headers, char *post_data);
@@ -156,6 +171,16 @@ struct http_response* handle_redirect_post(struct http_response* hresp, char* cu
 */
 struct http_response* http_req(char *http_headers, struct parsed_url *purl)
 {
+	
+	SSL *ssl; 
+	SSL_CTX *ctx; 
+	SSL_METHOD *client_method; 
+	X509 *server_cert;
+	
+	int sd,err;	
+	char *str;
+	int ishttps;
+	
 	/* Parse url */
 	if(purl == NULL)
 	{
@@ -195,28 +220,67 @@ struct http_response* http_req(char *http_headers, struct parsed_url *purl)
   	tmpres = inet_pton(AF_INET, purl->ip, (void *)(&(remote->sin_addr.s_addr)));
   	if( tmpres < 0)
   	{
+		free(remote);
     	printf("Can't set remote->sin_addr.s_addr");
     	return NULL;
   	}
 	else if(tmpres == 0)
   	{
+		free(remote);
 		printf("Not a valid IP");
     	return NULL;
   	}
 	remote->sin_port = htons(atoi(purl->port));
-
+	
+	if(atoi(purl->port) == 443)
+		ishttps = 1;
+	else
+		ishttps = 0;
+	
+	if(ishttps)
+	{
+		/* init ssl */
+		printf("(1) SSL context initialized\n\n"); 
+		SSLeay_add_ssl_algorithms();
+		client_method = SSLv23_client_method(); 
+		SSL_load_error_strings(); 
+		ctx = SSL_CTX_new(client_method);
+	}
 	/* Connect */
 	if(connect(sock, (struct sockaddr *)remote, sizeof(struct sockaddr)) < 0)
 	{
+		free(remote);
 	    printf("Could not connect");
 		return NULL;
 	}
-
+	if(ishttps)
+	{
+		printf("(3) TCP connection open to host '%s', port %d\n\n", purl->host, remote->sin_port); 
+		ssl = SSL_new(ctx);
+		SSL_set_fd(ssl, sock); /* attach SSL stack to socket */
+		
+		// SNI support
+		SSL_set_tlsext_host_name(ssl,purl->host);
+		
+		err = SSL_connect(ssl); /* initiate SSL handshake */ 
+		printf("(4) SSL endpoint created & handshake completed\n\n"); 
+		printf("(5) SSL connected with cipher: %s\n\n", SSL_get_cipher(ssl)); 
+		server_cert = SSL_get_peer_certificate(ssl); 
+		printf("(6) server's certificate was received:\n\n"); 
+		str = X509_NAME_oneline(X509_get_subject_name(server_cert), 0, 0); 
+		printf(" subject: %s\n", str); 
+		str = X509_NAME_oneline(X509_get_issuer_name(server_cert), 0, 0); 
+		printf(" issuer: %s\n\n", str); 
+		X509_free(server_cert);
+	}
 	/* Send headers to server */
 	int sent = 0;
 	while(sent < strlen(http_headers))
 	{
-	    tmpres = send(sock, http_headers+sent, strlen(http_headers)-sent, 0);
+		if(ishttps)
+			tmpres = SSL_write(ssl, http_headers+sent, strlen(http_headers)-sent);
+		else
+			tmpres = send(sock, http_headers+sent, strlen(http_headers)-sent, 0);
 		if(tmpres == -1)
 		{
 			printf("Can't send headers");
@@ -224,19 +288,39 @@ struct http_response* http_req(char *http_headers, struct parsed_url *purl)
 		}
 		sent += tmpres;
 	 }
+	
+	shutdown (sd, 1); /* send EOF to server */
+	if(ishttps)
+		printf("(7) sent HTTP request over encrypted channel:\n\n%s\n",http_headers);	
 
 	/* Recieve into response*/
 	char *response = (char*)malloc(0);
 	char BUF[BUFSIZ];
 	size_t recived_len = 0;
-	while((recived_len = recv(sock, BUF, BUFSIZ-1, 0)) > 0)
+
+//	while((recived_len = recv(sock, BUF, BUFSIZ-1, 0)) > 0)
+	if(ishttps)
 	{
-        BUF[recived_len] = '\0';
-		response = (char*)realloc(response, strlen(response) + strlen(BUF) + 1);
-		sprintf(response, "%s%s", response, BUF);
+		while((recived_len = SSL_read(ssl, BUF, BUFSIZ-1)) > 0)
+		{
+			BUF[recived_len] = '\0';
+			response = (char*)realloc(response, strlen(response) + strlen(BUF) + 1);
+			sprintf(response, "%s%s", response, BUF);
+		}
 	}
+	else {
+		while((recived_len = recv(sock, BUF, BUFSIZ-1, 0)) > 0)
+		{
+			BUF[recived_len] = '\0';
+			response = (char*)realloc(response, strlen(response) + strlen(BUF) + 1);
+			sprintf(response, "%s%s", response, BUF);			
+		}
+	}
+	
 	if (recived_len < 0)
     {
+		free(remote);
+		free(response);
 		free(http_headers);
 		#ifdef _WIN32
 			closesocket(sock);
@@ -250,20 +334,42 @@ struct http_response* http_req(char *http_headers, struct parsed_url *purl)
 	/* Reallocate response */
 	response = (char*)realloc(response, strlen(response) + 1);
 
+	if(ishttps)
+		printf ("(8) HTTP response:\n\n%s\n",response); 
+
 	/* Close socket */
 	#ifdef _WIN32
 		closesocket(sock);
 	#else
+	if(ishttps)
+	{
+		SSL_shutdown(ssl); 
 		close(sock);
+		SSL_free (ssl); 
+		SSL_CTX_free (ctx);
+	}
+	else {
+		close(sock);
+	}
 	#endif
 
 	/* Parse status code and text */
-	char *status_line = get_until(response, "\r\n");
-	status_line = str_replace("HTTP/1.1 ", "", status_line);
-	char *status_code = str_ndup(status_line, 4);
-	status_code = str_replace(" ", "", status_code);
-	char *status_text = str_replace(status_code, "", status_line);
-	status_text = str_replace(" ", "", status_text);
+	char *status = get_until(response, "\r\n");
+	char *status_line = str_replace("HTTP/1.1 ", "", status);
+	
+	free(status);
+	
+	status = strndup(status_line, 4);
+	char *status_code = str_replace(" ", "", status);
+	
+	free(status);
+	
+	status = str_replace(status_code, "", status_line);
+	char *status_text = str_replace(" ", "", status);
+	
+	free(status);
+	free(status_line);
+	
 	hresp->status_code = status_code;
 	hresp->status_code_int = atoi(status_code);
 	hresp->status_text = status_text;
@@ -282,9 +388,97 @@ struct http_response* http_req(char *http_headers, struct parsed_url *purl)
 	char *body = strstr(response, "\r\n\r\n");
 	body = str_replace("\r\n\r\n", "", body);
 	hresp->body = body;
+	
+	free(remote);
+	free(response);
+	
 
 	/* Return response */
 	return hresp;
+}
+
+
+/*
+Makes a HTTP PUT request to the given url
+*/
+struct http_response* http_put(char *url, char *custom_headers)
+{
+	/* Parse url */
+	struct parsed_url *purl = parse_url(url);
+	if(purl == NULL)
+		{
+			printf("Unable to parse url");
+			return NULL;
+		}
+	
+	/* Declare variable */
+	char *http_headers = (char*)malloc(1024);
+	memset(http_headers, 0, 1024);
+	
+	/* Build query/headers */
+	if(purl->path != NULL)
+		{
+			if(purl->query != NULL)
+				{
+					sprintf(http_headers, "PUT /%s?%s HTTP/1.1\r\nHost:%s\r\nConnection:close\r\n", purl->path, purl->query, purl->host);
+				}
+			else
+				{
+					sprintf(http_headers, "PUT /%s HTTP/1.1\r\nHost:%s\r\napplication/javascript\r\nContent-length: %d\r\nConnection:close\r\n\r\n%s", \
+						purl->path, purl->host, strlen(custom_headers),custom_headers);
+				}
+		}
+	else
+		{
+			if(purl->query != NULL)
+				{
+					sprintf(http_headers, "PUT /?%s HTTP/1.1\r\nHost:%s\r\nConnection:close\r\n", purl->query, purl->host);
+				}
+			else
+				{
+					sprintf(http_headers, "PUT / HTTP/1.1\r\nHost:%s\r\nConnection:close\r\n", purl->host);
+				}
+		}
+	
+	/* Handle authorisation if needed */
+	if(purl->username != NULL)
+		{
+			/* Format username:password pair */
+			char *upwd = (char*)malloc(1024);
+			sprintf(upwd, "%s:%s", purl->username, purl->password);
+			upwd = (char*)realloc(upwd, strlen(upwd) + 1);
+			
+			/* Base64 encode */
+			char *base64 = base64_encode(upwd);
+			
+			/* Form header */
+			char *auth_header = (char*)malloc(1024);
+			sprintf(auth_header, "Authorization: Basic %s\r\n", base64);
+			auth_header = (char*)realloc(auth_header, strlen(auth_header) + 1);
+			
+			/* Add to header */
+			http_headers = (char*)realloc(http_headers, strlen(http_headers) + strlen(auth_header) + 2);
+			sprintf(http_headers, "%s%s", http_headers, auth_header);
+		}
+
+	/* Add custom headers, and close */
+	if(custom_headers != NULL)
+		{
+			sprintf(http_headers, "%s%s\r\n", http_headers, custom_headers);
+		}
+	else
+		{
+			sprintf(http_headers, "%s\r\n", http_headers);
+		}
+
+	http_headers = (char*)realloc(http_headers, strlen(http_headers) + 1);
+
+	/* Make request and return response */
+	struct http_response *hresp = http_req(http_headers, purl);
+	
+	/* Handle redirect */
+	return handle_redirect_get(hresp, custom_headers);
+
 }
 
 /*

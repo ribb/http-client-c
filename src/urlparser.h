@@ -23,7 +23,9 @@
 	Hyper Text Transfer Protocol:
 	
 	http://www.ietf.org/rfc/rfc2616.txt
-*/
+    */
+    #include <string.h>
+
 
 /*
 	Represents an url
@@ -312,7 +314,10 @@ struct parsed_url *parse_url(const char *url)
     }
 	else
 	{
-		purl->port = "80";
+        if(strncmp(url,"https",5)==0)
+            purl->port = "443";
+        else
+            purl->port = "80";
 	}
 	
 	/* Get ip */
